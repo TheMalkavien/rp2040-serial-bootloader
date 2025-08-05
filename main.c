@@ -19,8 +19,7 @@
 
 #ifdef DEBUG
 #include <stdio.h>
-#include "pico/stdio_usb.h"
-#define DBG_PRINTF_INIT() stdio_usb_init()
+#define DBG_PRINTF_INIT() { }
 #define DBG_PRINTF(...) printf(__VA_ARGS__)
 #else
 #define DBG_PRINTF_INIT() { }
@@ -31,7 +30,7 @@
 //  - BOOTLOADER_ENTRY_PIN is low
 //  - Watchdog scratch[5] == BOOTLOADER_ENTRY_MAGIC && scratch[6] == ~BOOTLOADER_ENTRY_MAGIC
 //  - No valid image header
-#define BOOTLOADER_ENTRY_PIN 15
+#define BOOTLOADER_ENTRY_PIN 22
 #define BOOTLOADER_ENTRY_MAGIC 0xb105f00d
 
 #define UART_TX_PIN 0
@@ -209,6 +208,22 @@ const struct command_desc cmds[] = {
 const unsigned int N_CMDS = (sizeof(cmds) / sizeof(cmds[0]));
 const uint32_t MAX_NARG = 5;
 const uint32_t MAX_DATA_LEN = 1024; //FLASH_SECTOR_SIZE;
+
+static void print_int(uint32_t value)
+{
+	char hex_chars[] = "0123456789ABCDEF";
+	uint8_t *val = (uint8_t *)&value;
+
+	for (int i = 0; i < 4; i++)
+	{
+		char high = hex_chars[(val[i] >> 4) & 0x0F];
+		char low  = hex_chars[val[i] & 0x0F];
+		uart_write_blocking(uart0, (uint8_t *)&high, 1);
+		uart_write_blocking(uart0, (uint8_t *)&low, 1);
+		uart_write_blocking(uart0, (uint8_t *)" ", 1); // espace entre les octets
+	}
+	uart_write_blocking(uart0, (uint8_t *)"\r\n", 2); // fin de ligne
+}
 
 static bool is_error(uint32_t status)
 {
@@ -437,7 +452,16 @@ static bool image_header_ok(struct image_header *hdr)
 	}
 
 	// Reset vector should be in the image, and thumb (bit 0 set)
-	if ((vtor[1] < hdr->vtor) || (vtor[1] > hdr->vtor + hdr->size) || !(vtor[1] & 1)) {
+	/*if (vtor[1] < hdr->vtor)
+		return false;*/
+
+	if (vtor[1] > hdr->vtor + hdr->size)
+	{
+		return false;
+	}
+
+	if  (!(vtor[1] & 1))
+	 {
 		return false;
 	}
 
@@ -680,6 +704,40 @@ static bool should_stay_in_bootloader()
 	return !gpio_get(BOOTLOADER_ENTRY_PIN) || wd_says_so;
 }
 
+static void print_uint32_decimal(uint32_t value)
+{
+	char buf[10]; // Max uint32_t = 4294967295 -> 10 digits
+	int i = 0;
+
+	// Gère le cas zéro
+	if (value == 0) {
+		char c = '0';
+		uart_write_blocking(uart0, (uint8_t *)&c, 1);
+		uart_write_blocking(uart0, (uint8_t *)"\r\n", 2);
+		return;
+	}
+
+	// On remplit à l’envers
+	while (value > 0 && i < sizeof(buf)) {
+		buf[i++] = '0' + (value % 10);
+		value /= 10;
+	}
+
+	// Affiche dans l’ordre correct
+	while (i--) {
+		uart_write_blocking(uart0, (uint8_t *)&buf[i], 1);
+	}
+	uart_write_blocking(uart0, (uint8_t *)"\r\n", 2);
+}
+
+static void uart_write_str(const char *str) {
+    while (*str) {
+        uart_write_blocking(uart0, (const uint8_t *)str, 1);
+        str++;
+    }
+}
+
+
 int main(void)
 {
 	gpio_init(PICO_DEFAULT_LED_PIN);
@@ -707,6 +765,11 @@ int main(void)
 	gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
 	gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
 	uart_set_hw_flow(uart0, false, false);
+
+/*
+	print_int(hdr->vtor);
+	print_int(hdr->size);
+	uart_write_blocking(uart0, "END DEBUG", 9);*/
 
 	struct cmd_context ctx;
 	uint8_t uart_buf[(sizeof(uint32_t) * (1 + MAX_NARG)) + MAX_DATA_LEN];
