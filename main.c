@@ -33,8 +33,8 @@
 #define BOOTLOADER_ENTRY_PIN 22
 #define BOOTLOADER_ENTRY_MAGIC 0xb105f00d
 
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
+#define UART_TX_PIN 8 // UART1  to avoid conflicts with the USB serial
+#define UART_RX_PIN 9 // UART1  to avoid conflicts with the USB serial
 #define UART_BAUD   921600
 
 #define CMD_SYNC   (('S' << 0) | ('Y' << 8) | ('N' << 16) | ('C' << 24))
@@ -218,11 +218,11 @@ static void print_int(uint32_t value)
 	{
 		char high = hex_chars[(val[i] >> 4) & 0x0F];
 		char low  = hex_chars[val[i] & 0x0F];
-		uart_write_blocking(uart0, (uint8_t *)&high, 1);
-		uart_write_blocking(uart0, (uint8_t *)&low, 1);
-		uart_write_blocking(uart0, (uint8_t *)" ", 1); // espace entre les octets
+		uart_write_blocking(uart1, (uint8_t *)&high, 1);
+		uart_write_blocking(uart1, (uint8_t *)&low, 1);
+		uart_write_blocking(uart1, (uint8_t *)" ", 1); // espace entre les octets
 	}
-	uart_write_blocking(uart0, (uint8_t *)"\r\n", 2); // fin de ligne
+	uart_write_blocking(uart1, (uint8_t *)"\r\n", 2); // fin de ligne
 }
 
 static bool is_error(uint32_t status)
@@ -598,10 +598,8 @@ static enum state state_wait_for_sync(struct cmd_context *ctx)
 
 	ctx->status = CMD_SYNC;
 
-	gpio_put(PICO_DEFAULT_LED_PIN, 1);
-
 	while (idx < sizeof(ctx->opcode)) {
-		uart_read_blocking(uart0, &recv[idx], 1);
+		uart_read_blocking(uart1, &recv[idx], 1);
 		gpio_xor_mask((1 << PICO_DEFAULT_LED_PIN));
 
 		if (recv[idx] != match[idx]) {
@@ -620,7 +618,7 @@ static enum state state_wait_for_sync(struct cmd_context *ctx)
 
 static enum state state_read_opcode(struct cmd_context *ctx)
 {
-	uart_read_blocking(uart0, (uint8_t *)&ctx->opcode, sizeof(ctx->opcode));
+	uart_read_blocking(uart1, (uint8_t *)&ctx->opcode, sizeof(ctx->opcode));
 
 	return STATE_READ_ARGS;
 }
@@ -640,7 +638,7 @@ static enum state state_read_args(struct cmd_context *ctx)
 	ctx->resp_args = ctx->args;
 	ctx->resp_data = (uint8_t *)(ctx->resp_args + desc->resp_nargs);
 
-	uart_read_blocking(uart0, (uint8_t *)ctx->args, sizeof(*ctx->args) * desc->nargs);
+	uart_read_blocking(uart1, (uint8_t *)ctx->args, sizeof(*ctx->args) * desc->nargs);
 
 	return STATE_READ_DATA;
 }
@@ -661,7 +659,7 @@ static enum state state_read_data(struct cmd_context *ctx)
 
 	// TODO: Check sizes
 
-	uart_read_blocking(uart0, (uint8_t *)ctx->data, ctx->data_len);
+	uart_read_blocking(uart1, (uint8_t *)ctx->data, ctx->data_len);
 
 	return STATE_HANDLE_DATA;
 }
@@ -682,7 +680,7 @@ static enum state state_handle_data(struct cmd_context *ctx)
 
 	size_t resp_len = sizeof(ctx->status) + (sizeof(*ctx->resp_args) * desc->resp_nargs) + ctx->resp_data_len;
 	memcpy(ctx->uart_buf, &ctx->status, sizeof(ctx->status));
-	uart_write_blocking(uart0, ctx->uart_buf, resp_len);
+	uart_write_blocking(uart1, ctx->uart_buf, resp_len);
 
 	return STATE_READ_OPCODE;
 }
@@ -691,7 +689,7 @@ static enum state state_error(struct cmd_context *ctx)
 {
 	size_t resp_len = sizeof(ctx->status);
 	memcpy(ctx->uart_buf, &ctx->status, sizeof(ctx->status));
-	uart_write_blocking(uart0, ctx->uart_buf, resp_len);
+	uart_write_blocking(uart1, ctx->uart_buf, resp_len);
 
 	return STATE_WAIT_FOR_SYNC;
 }
@@ -712,8 +710,8 @@ static void print_uint32_decimal(uint32_t value)
 	// Gère le cas zéro
 	if (value == 0) {
 		char c = '0';
-		uart_write_blocking(uart0, (uint8_t *)&c, 1);
-		uart_write_blocking(uart0, (uint8_t *)"\r\n", 2);
+		uart_write_blocking(uart1, (uint8_t *)&c, 1);
+		uart_write_blocking(uart1, (uint8_t *)"\r\n", 2);
 		return;
 	}
 
@@ -725,14 +723,14 @@ static void print_uint32_decimal(uint32_t value)
 
 	// Affiche dans l’ordre correct
 	while (i--) {
-		uart_write_blocking(uart0, (uint8_t *)&buf[i], 1);
+		uart_write_blocking(uart1, (uint8_t *)&buf[i], 1);
 	}
-	uart_write_blocking(uart0, (uint8_t *)"\r\n", 2);
+	uart_write_blocking(uart1, (uint8_t *)"\r\n", 2);
 }
 
 static void uart_write_str(const char *str) {
     while (*str) {
-        uart_write_blocking(uart0, (const uint8_t *)str, 1);
+        uart_write_blocking(uart1, (const uint8_t *)str, 1);
         str++;
     }
 }
@@ -749,6 +747,7 @@ int main(void)
 	gpio_set_dir(BOOTLOADER_ENTRY_PIN, 0);
 
 	sleep_ms(10);
+	gpio_put(PICO_DEFAULT_LED_PIN, 0);
 
 	struct image_header *hdr = (struct image_header *)(XIP_BASE + IMAGE_HEADER_OFFSET);
 
@@ -761,15 +760,10 @@ int main(void)
 
 	DBG_PRINTF_INIT();
 
-	uart_init(uart0, UART_BAUD);
+	uart_init(uart1, UART_BAUD);
 	gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
 	gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-	uart_set_hw_flow(uart0, false, false);
-
-/*
-	print_int(hdr->vtor);
-	print_int(hdr->size);
-	uart_write_blocking(uart0, "END DEBUG", 9);*/
+	uart_set_hw_flow(uart1, false, false);
 
 	struct cmd_context ctx;
 	uint8_t uart_buf[(sizeof(uint32_t) * (1 + MAX_NARG)) + MAX_DATA_LEN];
