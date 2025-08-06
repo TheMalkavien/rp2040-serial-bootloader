@@ -1,3 +1,7 @@
+I just adapted this bootloader to my needs, working with a rp2040-lora.
+
+Thanks to usedbytes for his code and blog, very usefull.
+
 # RP2040 Serial Bootloader
 
 This is a bootloader for the RP2040 which enables code upload via UART.
