@@ -35,8 +35,8 @@
 #define BOOTLOADER_ENTRY_PIN 22
 #define BOOTLOADER_ENTRY_MAGIC 0xb105f00d
 
-#define UART_TX_PIN 8 // UART1  to avoid conflicts with the USB serial
-#define UART_RX_PIN 9 // UART1  to avoid conflicts with the USB serial
+#define UART_TX_PIN 8 // UART1 to avoid conflicts with the USB serial
+#define UART_RX_PIN 9 // UART1 to avoid conflicts with the USB serial
 #define UART_BAUD   921600
 
 #define CMD_SYNC   (('S' << 0) | ('Y' << 8) | ('N' << 16) | ('C' << 24))
@@ -61,7 +61,7 @@
 #define FLASH_ADDR_MAX (XIP_BASE + PICO_FLASH_SIZE_BYTES)
 
 // ------------------------------------------------------------
-// Raisons d'entrée + clignotement LED
+// Raisons d'entrée + clignotement LED + timeout d'inactivité
 // ------------------------------------------------------------
 enum boot_reason {
     BOOT_REASON_NONE  = 0,
@@ -76,6 +76,19 @@ static enum boot_reason g_boot_reason = BOOT_REASON_NONE;
 #define BLINK_ON_MS     120
 #define BLINK_OFF_MS    120
 #define BLINK_PAUSE_MS  600
+
+// Timeout d'inactivité (5 minutes)
+#define INACTIVITY_TIMEOUT_MS 300000UL
+
+static uint32_t g_last_activity_ms = 0;
+static void do_reboot(bool to_bootloader);
+static inline uint32_t now_ms(void) {
+    return to_ms_since_boot(get_absolute_time());
+}
+
+static inline void mark_activity(void) {
+    g_last_activity_ms = now_ms();
+}
 
 static inline bool wd_magic(void) {
     return (watchdog_hw->scratch[5] == BOOTLOADER_ENTRY_MAGIC) &&
@@ -107,17 +120,17 @@ static enum boot_reason compute_boot_reason(struct image_header *hdr) {
 
 // Service de clignotement non bloquant à appeler régulièrement
 static void blink_service(void) {
-    static uint32_t last_ms = 0;
+    static uint32_t last_ms_local = 0;
     static uint32_t phase_ms = 0;
     static uint32_t blinks_done = 0;
     static bool led_on = false;
 
     if (g_boot_reason == BOOT_REASON_NONE) return;
 
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now == last_ms) return;
-    uint32_t dt = now - last_ms;
-    last_ms = now;
+    uint32_t now = now_ms();
+    if (now == last_ms_local) return;
+    uint32_t dt = now - last_ms_local;
+    last_ms_local = now;
 
     phase_ms += dt;
 
@@ -214,15 +227,25 @@ const unsigned int N_CMDS = (sizeof(cmds) / sizeof(cmds[0]));
 const uint32_t MAX_NARG = 5;
 const uint32_t MAX_DATA_LEN = 1024; //FLASH_SECTOR_SIZE;
 
-// ---------- util UART non bloquant qui préserve le clignotement ----------
+// ---------- util UART non bloquant qui préserve le clignotement + activité ----------
 static void uart_read_exact(uint8_t *buf, size_t len) {
     size_t i = 0;
     while (i < len) {
         while (!uart_is_readable(uart1)) {
-            blink_service();        // on continue de clignoter
+            blink_service();
+            // Vérifie le timeout aussi pendant l'attente
+            if ((now_ms() - g_last_activity_ms) >= INACTIVITY_TIMEOUT_MS) {
+                // reboot normal (pas demande explicite bootloader)
+                do {
+                    // micro pause
+                    tight_loop_contents();
+                } while (0);
+                do_reboot(false);
+            }
             tight_loop_contents();
         }
         uart_read_blocking(uart1, &buf[i], 1);
+        mark_activity(); // activité détectée
         i++;
     }
 }
@@ -523,9 +546,13 @@ static enum state state_wait_for_sync(struct cmd_context *ctx)
     while (idx < (int)sizeof(ctx->opcode)) {
         while (!uart_is_readable(uart1)) {
             blink_service();
+            if ((now_ms() - g_last_activity_ms) >= INACTIVITY_TIMEOUT_MS) {
+                do_reboot(false); // ne revient pas
+            }
             tight_loop_contents();
         }
         uart_read_blocking(uart1, &recv[idx], 1);
+        mark_activity();
 
         if (recv[idx] != match[idx]) {
             idx = 0;
@@ -536,7 +563,6 @@ static enum state state_wait_for_sync(struct cmd_context *ctx)
 
     assert(ctx->opcode == CMD_SYNC);
 
-    // On ne coupe plus la LED ici: clignotement maintenu tant qu'on reste en bootloader
     return STATE_READ_ARGS;
 }
 
@@ -594,6 +620,7 @@ static enum state state_handle_data(struct cmd_context *ctx)
     size_t resp_len = sizeof(ctx->status) + (sizeof(*ctx->resp_args) * desc->resp_nargs) + ctx->resp_data_len;
     memcpy(ctx->uart_buf, &ctx->status, sizeof(ctx->status));
     uart_write_blocking(uart1, ctx->uart_buf, resp_len);
+    mark_activity(); // on considère la réponse comme activité
 
     return STATE_READ_OPCODE;
 }
@@ -603,6 +630,7 @@ static enum state state_error(struct cmd_context *ctx)
     size_t resp_len = sizeof(ctx->status);
     memcpy(ctx->uart_buf, &ctx->status, sizeof(ctx->status));
     uart_write_blocking(uart1, ctx->uart_buf, resp_len);
+    mark_activity();
     return STATE_WAIT_FOR_SYNC;
 }
 
@@ -634,6 +662,7 @@ static void uart_write_str(const char *str) {
         uart_write_blocking(uart1, (const uint8_t *)str, 1);
         str++;
     }
+    mark_activity();
 }
 
 int main(void)
@@ -668,6 +697,9 @@ int main(void)
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
     uart_set_hw_flow(uart1, false, false);
 
+    // Démarre le timer d'inactivité
+    mark_activity();
+
     struct cmd_context ctx;
     uint8_t uart_buf[(sizeof(uint32_t) * (1 + MAX_NARG)) + MAX_DATA_LEN];
     ctx.uart_buf = uart_buf;
@@ -676,6 +708,11 @@ int main(void)
     while (1) {
         // clignotement continu tant qu'on est en bootloader
         blink_service();
+
+        // Timeout d'inactivité global, même hors attente UART
+        if ((now_ms() - g_last_activity_ms) >= INACTIVITY_TIMEOUT_MS) {
+            do_reboot(false); // ne revient pas
+        }
 
         switch (state) {
         case STATE_WAIT_FOR_SYNC:
